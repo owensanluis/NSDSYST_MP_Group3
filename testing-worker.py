@@ -12,10 +12,12 @@ DATA_CSV = "dataset_phishing_trimmed.csv"
 RANDOM_STATE = 42
 POLL_INTERVAL = 0.5
 N_ESTIMATORS = 100
+N_JOBS = 1  # keep at 1-2 when running multiple worker processes on the same machine,
+            # otherwise each RandomForest fights the others for all CPU cores.
 
 
-def load_dataset():
-    df = pd.read_csv(DATA_CSV)
+def load_dataset(path):
+    df = pd.read_csv(path)
     y = df["status"]
     X = df.drop(columns=["status"])
     return X, y
@@ -34,7 +36,7 @@ def train_and_score(X, y, features):
     clf = RandomForestClassifier(
         n_estimators=N_ESTIMATORS,
         random_state=RANDOM_STATE,
-        n_jobs=-1,
+        n_jobs=N_JOBS,
     )
     clf.fit(X_train, y_train)
     preds = clf.predict(X_test)
@@ -46,7 +48,7 @@ def run_worker(worker_id, data_path):
     manager = Pyro5.api.Proxy(ns.lookup("fmax.manager"))
 
     print(f"[Worker {worker_id}] Loading dataset from {data_path}...")
-    X, y = load_dataset()
+    X, y = load_dataset(data_path)
     print(f"[Worker {worker_id}] Loaded {len(X)} rows, {len(X.columns)} candidate features")
 
     manager.register_worker(worker_id)

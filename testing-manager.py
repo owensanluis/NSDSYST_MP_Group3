@@ -13,7 +13,8 @@ ALL_FEATURES = [
     "nb_redirection_total", "suspicious_html_score",
 ]
 
-ELBOW_THRESHOLD = 0.02
+ELBOW_THRESHOLD = 0.005   # 0.5% gain per round counts as "low gain"
+STREAK_REQUIRED = 3       # consecutive low-gain rounds needed before locking in the elbow
 RESULTS_CSV = "fmax_results.csv"
 
 
@@ -37,7 +38,7 @@ class Manager:
         self.in_flight = {}
 
         # running states
-        self.current_best = [] 
+        self.current_best = []
         self.best_accuracy = 0.0
         self.results_log = []
 
@@ -45,11 +46,14 @@ class Manager:
         self.finished = False
         self.final_feature_set = None
 
-        # elbow point detection
+        # elbow point detection (streak-based, resistant to single noisy dips)
         self.elbow_found = False
         self.elbow_round = None
         self.elbow_features = None
         self.elbow_accuracy = None
+        self.low_gain_streak = 0
+        self.plateau_start_features = None
+        self.plateau_start_accuracy = None
 
         self._start_round()
 
@@ -77,6 +81,7 @@ class Manager:
         self.final_feature_set = self.current_best
 
         if not self.elbow_found:
+            # No plateau ever persisted long enough -- fall back to the full set.
             self.elbow_round = self.round_num
             self.elbow_features = list(self.current_best)
             self.elbow_accuracy = self.best_accuracy
@@ -111,24 +116,36 @@ class Manager:
         print(f"[Manager] Round {self.round_num} best: {best_feats} "
               f"acc={best_acc:.4f} (gain={gain:.4f})")
 
-        if not self.elbow_found and self.round_num > 1 and gain <= ELBOW_THRESHOLD:
-            self.elbow_found = True
-            self.elbow_round = self.round_num - 1
-            self.elbow_features = list(self.current_best)
-            self.elbow_accuracy = self.best_accuracy
-            self.results_log.append({
-                "round": self.elbow_round, "features": self.elbow_features,
-                "accuracy": self.elbow_accuracy, "worker": "ELBOW_POINT",
-            })
-            print(f"[Manager] Elbow point detected: round {self.elbow_round} "
-                  f"{self.elbow_features} acc={self.elbow_accuracy:.4f} "
-                  f"(gain at round {self.round_num} was {gain:.4f} <= {ELBOW_THRESHOLD}). "
-                  f"Continuing to run remaining rounds anyway.")
+        if not self.elbow_found and self.round_num > 1:
+            if gain <= ELBOW_THRESHOLD:
+                # First low-gain round in a potential streak: remember where
+                # the plateau would have started (i.e. the round BEFORE this
+                # one, since that's the last round with a real improvement).
+                if self.low_gain_streak == 0:
+                    self.plateau_start_features = list(self.current_best)
+                    self.plateau_start_accuracy = self.best_accuracy
+                self.low_gain_streak += 1
+            else:
+                # Gain recovered -- this wasn't a real plateau, reset the streak.
+                self.low_gain_streak = 0
+
+            if self.low_gain_streak >= STREAK_REQUIRED:
+                self.elbow_found = True
+                self.elbow_round = self.round_num - self.low_gain_streak
+                self.elbow_features = self.plateau_start_features
+                self.elbow_accuracy = self.plateau_start_accuracy
+                self.results_log.append({
+                    "round": self.elbow_round, "features": self.elbow_features,
+                    "accuracy": self.elbow_accuracy, "worker": "ELBOW_POINT",
+                })
+                print(f"[Manager] Elbow point detected: round {self.elbow_round} "
+                      f"{self.elbow_features} acc={self.elbow_accuracy:.4f} "
+                      f"({self.low_gain_streak} consecutive rounds under "
+                      f"{ELBOW_THRESHOLD}). Continuing to run remaining rounds anyway.")
 
         self.current_best = best_feats
         self.best_accuracy = best_acc
         self._start_round()
-
 
     def register_worker(self, worker_id):
         with self.lock:
@@ -177,8 +194,8 @@ class Manager:
 
 
 def main():
-    daemon = Pyro5.api.Daemon() ################# <- host="IP_address"
-    ns = Pyro5.api.locate_ns() ################# <- IP_address, 9090
+    daemon = Pyro5.api.Daemon()  ################# <- host="IP_address"
+    ns = Pyro5.api.locate_ns()  ################# <- IP_address, 9090
     manager = Manager()
     uri = daemon.register(manager)
 
