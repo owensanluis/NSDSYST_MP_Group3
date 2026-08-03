@@ -5,8 +5,7 @@ import uuid
 import Pyro5.api
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 DATA_CSV = "dataset_phishing_trimmed.csv"
 RANDOM_STATE = 42
@@ -14,6 +13,8 @@ POLL_INTERVAL = 0.5
 N_ESTIMATORS = 100
 N_JOBS = 1  # keep at 1-2 when running multiple worker processes on the same machine,
             # otherwise each RandomForest fights the others for all CPU cores.
+N_FOLDS = 5  # 5-fold CV instead of a single 80/20 split, so one lucky/unlucky
+             # split can't sway which feature "wins" a round.
 
 
 def load_dataset(path):
@@ -24,27 +25,24 @@ def load_dataset(path):
 
 
 def train_and_score(X, y, features):
+    """5-fold stratified CV: trains/evaluates 5 times on 5 different splits
+    and returns the mean accuracy, so a single lucky/unlucky split can't
+    decide which feature wins a round."""
     X_sub = X[features]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_sub, y,
-        test_size=0.2,
-        stratify=y,
-        random_state=RANDOM_STATE,
-    )
 
     clf = RandomForestClassifier(
         n_estimators=N_ESTIMATORS,
         random_state=RANDOM_STATE,
         n_jobs=N_JOBS,
     )
-    clf.fit(X_train, y_train)
-    preds = clf.predict(X_test)
-    return accuracy_score(y_test, preds)
+
+    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    scores = cross_val_score(clf, X_sub, y, cv=cv, scoring="accuracy", n_jobs=1)
+    return scores.mean()
 
 
 def run_worker(worker_id, data_path):
-    ns = Pyro5.api.locate_ns()  ################# <- IP_address, 9090
+    ns = Pyro5.api.locate_ns("localhost", 9090)  ################# <- IP_address, 9090
     manager = Pyro5.api.Proxy(ns.lookup("fmax.manager"))
 
     print(f"[Worker {worker_id}] Loading dataset from {data_path}...")
@@ -72,8 +70,9 @@ def run_worker(worker_id, data_path):
         acc = train_and_score(X, y, features)
         tasks_done += 1
         print(f"[Worker {worker_id}] round={round_num} task={task_id} "
-              f"n_features={len(features)} acc={acc:.4f}")
+              f"n_features={len(features)} cv_acc(mean of {N_FOLDS} folds)={acc:.4f}")
 
+        acc = float(acc)
         manager.report_result(task_id, worker_id, acc)
 
 

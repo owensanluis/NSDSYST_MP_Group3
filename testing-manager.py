@@ -31,8 +31,15 @@ class Manager:
 
         self.workers = set()
 
+        # total rounds = one round per feature we could still add, since this
+        # is sequential forward feature selection over the full feature list
+        self.total_rounds = len(ALL_FEATURES)
+
         # task ID counter
         self._next_task_id = 0
+
+        # status/monitoring
+        self.tasks_completed_total = 0
 
         # round state
         self.round_num = 0
@@ -222,6 +229,7 @@ class Manager:
 
             self.task_assigned_at.pop(task_id, None)
             self.task_worker.pop(task_id, None)
+            self.tasks_completed_total += 1
 
             self.results_log.append({
                 "round": self.round_num, "features": feats,
@@ -237,6 +245,24 @@ class Manager:
     def is_finished(self):
         return self.finished
 
+    def get_status(self):
+        """Live status snapshot -- safe to poll frequently for a dashboard."""
+        with self.lock:
+            return {
+                "finished": self.finished,
+                "round": self.round_num,
+                "total_rounds": self.total_rounds,
+                "tasks_completed_this_round": len(self.round_results),
+                "tasks_expected_this_round": self.expected_in_round,
+                "tasks_completed_total": self.tasks_completed_total,
+                "connected_workers": len(self.workers),
+                "best_accuracy": self.best_accuracy,
+                "current_best_features": list(self.current_best),
+                "reassigned_count": self.reassigned_count,
+                "elbow_found": self.elbow_found,
+                "elbow_round": self.elbow_round,
+            }
+
     def get_final_result(self):
         if not self.finished:
             return None
@@ -251,8 +277,8 @@ class Manager:
 
 
 def main():
-    daemon = Pyro5.api.Daemon()  ################# <- host="IP_address"
-    ns = Pyro5.api.locate_ns()  ################# <- IP_address, 9090
+    daemon = Pyro5.api.Daemon(host="localhost")  ################# <- host="IP_address", port=9090
+    ns = Pyro5.api.locate_ns("localhost", 9090)  ################# <- IP_address, 9090
     manager = Manager()
     uri = daemon.register(manager)
 
