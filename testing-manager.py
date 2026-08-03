@@ -17,6 +17,9 @@ ELBOW_THRESHOLD = 0.005   # 0.5% gain per round counts as "low gain"
 STREAK_REQUIRED = 3       # consecutive low-gain rounds needed before locking in the elbow
 RESULTS_CSV = "fmax_results.csv"
 
+TASK_TIMEOUT = 30.0            # seconds a task can be in-flight before it's considered lost
+TIMEOUT_CHECK_INTERVAL = 5.0   # how often the watchdog thread checks for stale tasks
+
 
 @Pyro5.api.expose
 @Pyro5.api.behavior(instance_mode="single")
@@ -37,6 +40,11 @@ class Manager:
         self.expected_in_round = 0
         self.in_flight = {}
 
+        # fault tolerance: task timeout + reassignment
+        self.task_assigned_at = {}   # task_id -> timestamp it was last handed out
+        self.task_worker = {}        # task_id -> worker_id currently holding it
+        self.reassigned_count = 0    # stats, for the final summary
+
         # running states
         self.current_best = []
         self.best_accuracy = 0.0
@@ -56,6 +64,37 @@ class Manager:
         self.plateau_start_accuracy = None
 
         self._start_round()
+
+        # start the watchdog thread that reassigns stale/lost tasks
+        self._watchdog_thread = threading.Thread(target=self._timeout_watcher, daemon=True)
+        self._watchdog_thread.start()
+
+    # ---------- fault tolerance: timeout + reassignment ----------
+
+    def _timeout_watcher(self):
+        """Runs in the background for the lifetime of the Manager. Any task
+        that has been handed to a Worker but not reported back within
+        TASK_TIMEOUT seconds is assumed lost (Worker crashed, froze, lost
+        connection, etc.) and is put back on the queue for another Worker
+        to pick up."""
+        while not self.finished:
+            time.sleep(TIMEOUT_CHECK_INTERVAL)
+            now = time.time()
+            with self.lock:
+                for tid, assigned_at in list(self.task_assigned_at.items()):
+                    if tid not in self.in_flight:
+                        continue  # already completed/removed since we grabbed the list
+                    if now - assigned_at > TASK_TIMEOUT:
+                        feats = self.in_flight[tid]
+                        stale_worker = self.task_worker.get(tid, "unknown")
+                        self.task_queue.put((tid, self.round_num, feats))
+                        self.task_assigned_at[tid] = now  # reset the clock for the new attempt
+                        self.reassigned_count += 1
+                        print(f"[Manager] Task {tid} ({feats}) timed out after "
+                              f"{TASK_TIMEOUT}s on {stale_worker} -- reassigned "
+                              f"(total reassignments so far: {self.reassigned_count})")
+
+    # ---------------------------------------------------------------
 
     def _start_round(self):
         self.round_num += 1
@@ -94,6 +133,8 @@ class Manager:
               f"{self.final_feature_set} (accuracy={self.best_accuracy:.4f})")
         print(f"[Manager] Elbow point: round {self.elbow_round}, "
               f"features={self.elbow_features}, accuracy={self.elbow_accuracy:.4f}")
+        print(f"[Manager] Fault tolerance summary: {self.reassigned_count} "
+              f"task(s) were reassigned due to timeout during this run.")
         self._write_csv()
 
     def _write_csv(self):
@@ -160,13 +201,28 @@ class Manager:
             tid, rnd, feats = self.task_queue.get_nowait()
         except queue.Empty:
             return None
+        with self.lock:
+            # A task pulled here might be brand new, or it might be a
+            # reassigned task that timed out on a different Worker -- either
+            # way, record who has it now and reset its clock.
+            self.task_assigned_at[tid] = time.time()
+            self.task_worker[tid] = worker_id
         return {"task_id": tid, "round": rnd, "features": feats}
 
     def report_result(self, task_id, worker_id, accuracy):
         with self.lock:
             feats = self.in_flight.pop(task_id, None)
             if feats is None:
-                return "unknown task_id"
+                # Either an unknown task, or this task was already completed
+                # by another Worker after a timeout reassignment -- the
+                # first result to arrive wins, this one is safely ignored.
+                print(f"[Manager] Ignoring late/duplicate result for task "
+                      f"{task_id} from {worker_id} (already completed).")
+                return "stale task_id, ignored"
+
+            self.task_assigned_at.pop(task_id, None)
+            self.task_worker.pop(task_id, None)
+
             self.results_log.append({
                 "round": self.round_num, "features": feats,
                 "accuracy": accuracy, "worker": worker_id,
@@ -190,6 +246,7 @@ class Manager:
             "elbow_round": self.elbow_round,
             "elbow_features": self.elbow_features,
             "elbow_accuracy": self.elbow_accuracy,
+            "reassigned_count": self.reassigned_count,
         }
 
 
